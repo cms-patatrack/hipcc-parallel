@@ -116,6 +116,31 @@ ahead) and each token is kept in its own file (a token byte may be NUL or unprin
 The regression test for this is that a **follow-up** `make -j4` still completes — leaked
 tokens hang the *next* target, not the current one.
 
+## Signals and interruption
+
+`^C` on the build must stop the compiles it started. Two things make that harder than it
+looks, and both were getting in the way:
+
+- **bash sets `SIGINT` and `SIGQUIT` to `SIG_IGN` in every `&` child of a non-interactive
+  shell**, and an ignored disposition survives `exec`. The `^C` that the terminal delivers
+  to make's foreground process group therefore reached make and the wrapper, but never the
+  `hipcc` jobs: make printed `Error 130`, the shell prompt came back, and N device compiles
+  kept running in the background, invisible and still burning cores.
+- **Signalling the direct child is not enough**: `hipcc` is a driver that forks `clang`,
+  which forks `cc1`. Killing the process we started leaves the grandchildren behind.
+
+So the wrapper enables job control (`set -m`), which gives every job its own process group
+and stops bash from ignoring `SIGINT` on its behalf. `INT`, `TERM`, `HUP` and `QUIT` are
+forwarded to each job's *whole* group, the wrapper waits for them to actually exit (with a
+`SIGKILL` fallback for anything that will not), and only then hands the jobserver tokens
+back and removes the temporary directory — releasing a token while its job is still running
+would over-subscribe the build, and removing the directory would pull the ground out from
+under a live compile. Finally the wrapper re-raises the signal on itself, so make reports
+`Interrupt` and stops the build rather than recording a recipe that merely failed.
+
+Because the jobs are no longer in the terminal's foreground process group, `^Z` no longer
+reaches them either, so `SIGTSTP`/`SIGCONT` are forwarded as well.
+
 ## Environment variables
 
 | variable | effect |

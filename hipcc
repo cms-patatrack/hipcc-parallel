@@ -25,6 +25,10 @@
 # ADDITIONAL concurrent job, so a -jN build does not turn into N*archs processes.
 # Without a jobserver it behaves as before and runs all architectures at once.
 #
+# Ctrl+C takes the sub-compiles with it.  Each job runs in its own process
+# group, so the wrapper can signal a whole hipcc/clang/cc1 tree, wait for it to
+# die, and only then give back jobserver tokens and remove its temporaries.
+#
 # The wrapper falls back to plain hipcc whenever it is not confident it can
 # reproduce the same result (linking, preprocessing, fewer than two
 # architectures, anything unexpected in the -### output, ...).
@@ -232,18 +236,91 @@ js_release_all() {
     JS_TOKENS=0
 }
 
-cleanup() {
-    js_release_all
-    [ "${HIPCC_PARALLEL_DEBUG:-0}" = 1 ] || rm -rf "$TMPDIR_W"
-}
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT TERM
-
 # Job NARCH is the host compile, jobs 0..NARCH-1 are the device compiles.
 # Each gets its own directory: clang drops per-architecture temporaries next to
 # its output, so this keeps concurrent jobs from colliding.
 HOSTJOB=$NARCH
 declare -a PIDS=() RC=()
+
+# ------------------------------------------------------- signals / clean exit
+# The sub-compiles must die with us.  Two things stand in the way:
+#
+#   * bash sets SIGINT and SIGQUIT to SIG_IGN in every '&' child of a
+#     non-interactive shell, and an ignored disposition survives exec.  A Ctrl+C
+#     delivered to make's process group therefore never reaches our jobs: make
+#     and the wrapper die, hipcc/clang/cc1 keep compiling, orphaned.
+#   * killing the hipcc we started is not enough either: it is a driver that
+#     forks clang, which forks cc1.  Signalling only the direct child leaves the
+#     grandchildren behind.
+#
+# So job control is enabled, which puts every job in its own process group (and
+# stops bash from ignoring SIGINT on its behalf), and we signal that whole
+# group.  Since the jobs are no longer in the terminal's foreground group they
+# no longer get Ctrl+C by themselves - it is forwarded here instead.
+JOBCTL=0
+set -m 2>/dev/null && JOBCTL=1 || debug "job control unavailable: killing direct children only"
+
+# $1 = signal name.  Sends it to each job's whole process group.
+kill_jobs() {
+    local sig=$1 j pid
+    for ((j = 0; j < ${#PIDS[@]}; j++)); do
+        pid=${PIDS[$j]:-}
+        [ -n "$pid" ] || continue
+        [ "$JOBCTL" -eq 1 ] && kill -"$sig" -- "-$pid" 2>/dev/null
+        kill -"$sig" -- "$pid" 2>/dev/null
+    done
+    return 0
+}
+
+# Stop every job and do not return until they are really gone: the temporary
+# directory must not be removed, and jobserver tokens must not be handed back,
+# while a compile is still running.
+terminate_jobs() {
+    local sig=${1:-TERM} p wd n=0
+    for p in ${PIDS[@]+"${PIDS[@]}"}; do [ -n "$p" ] && n=$((n+1)); done
+    [ "$n" -gt 0 ] || return 0
+    debug "terminating $n job(s) with SIG$sig"
+    kill_jobs "$sig"
+    # Insist if something declines to go away; clang exits on the first signal,
+    # but we must not hang the build on anything that does not.
+    ( sleep 2; kill_jobs KILL ) >/dev/null 2>&1 &
+    wd=$!
+    for p in "${PIDS[@]}"; do [ -n "$p" ] && wait "$p" 2>/dev/null; done
+    [ "$JOBCTL" -eq 1 ] && kill -TERM -- "-$wd" 2>/dev/null
+    kill -TERM -- "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    PIDS=()
+}
+
+cleanup() {
+    terminate_jobs TERM       # a no-op once the jobs have been reaped
+    js_release_all            # only now: the tokens covered those jobs
+    [ "${HIPCC_PARALLEL_DEBUG:-0}" = 1 ] || rm -rf "$TMPDIR_W"
+}
+trap cleanup EXIT
+
+# $1 = the signal we caught.  Pass it on, clean up, then die from it ourselves
+# so make sees an interrupted recipe rather than an ordinary failure.
+on_signal() {
+    trap - INT TERM HUP QUIT EXIT     # a second Ctrl+C must not re-enter this
+    terminate_jobs "$1"
+    js_release_all
+    [ "${HIPCC_PARALLEL_DEBUG:-0}" = 1 ] || rm -rf "$TMPDIR_W"
+    kill -"$1" -- "$$" 2>/dev/null
+    exit $((128 + $(kill -l "$1" 2>/dev/null || echo 15)))
+}
+trap 'on_signal INT'  INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP'  HUP
+trap 'on_signal QUIT' QUIT
+
+# Ctrl+Z used to stop the compiles along with the rest of the foreground group;
+# now that they have groups of their own, suspend and resume them by hand.
+on_stop() {
+    kill_jobs STOP
+    trap - TSTP; kill -STOP -- "$$" 2>/dev/null; trap on_stop TSTP
+}
+trap on_stop TSTP
+trap 'kill_jobs CONT' CONT
 
 launch() {
     local idx=$1
@@ -269,7 +346,9 @@ launch() {
     else
         args+=(--offload-device-only "--offload-arch=${ARCHS[$idx]}" -o "$d/dev.bc")
     fi
-    "$REAL_HIPCC" "${args[@]}" > "$d/log" 2>&1 &
+    # No stdin: with job control on, a background group that reads the
+    # terminal is stopped by SIGTTIN, and a compile has nothing to read anyway.
+    "$REAL_HIPCC" "${args[@]}" < /dev/null > "$d/log" 2>&1 &
     PIDS[$idx]=$!
 }
 
@@ -315,6 +394,9 @@ done
 failed=0
 for ((j = 0; j < NJOBS; j++)); do
     wait "${PIDS[$j]}"; RC[$j]=$?
+    # Forget the pid once reaped: the OS may hand it to somebody else, and
+    # cleanup() must never signal a process group that is no longer ours.
+    PIDS[$j]=""
     [ "${RC[$j]}" -ne 0 ] && failed=1
 done
 
@@ -351,7 +433,9 @@ for t in "${TGT[@]}"; do
         BARGS+=("-input=$TMPDIR_W/$HOSTJOB/host.o")
     else
         idx=$(arch_index "${t##*-}")
-        [ -n "$idx" ] || { warn "target '$t' matches no --offload-arch; falling back"; exec "$REAL_HIPCC" "$@"; }
+        # exec replaces this shell, so the EXIT trap would never run: hand the
+        # jobserver tokens back and drop the temporaries before leaving.
+        [ -n "$idx" ] || { warn "target '$t' matches no --offload-arch; falling back"; cleanup; trap - EXIT; exec "$REAL_HIPCC" "$@"; }
         BARGS+=("-input=$TMPDIR_W/$idx/dev.bc")
     fi
 done
@@ -359,6 +443,7 @@ BARGS+=("-output=$OUTPUT")
 
 if ! "$BUNDLER" "${BARGS[@]}"; then
     warn "clang-offload-bundler failed; falling back to a single serial compile"
+    cleanup; trap - EXIT
     exec "$REAL_HIPCC" "$@"
 fi
 
