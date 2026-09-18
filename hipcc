@@ -1,0 +1,366 @@
+#!/bin/bash
+#
+# hipcc wrapper that compiles a single source file for several GPU
+# architectures in parallel.
+#
+# hipcc/clang walks its --offload-arch list sequentially: for a translation
+# unit with N architectures the device passes run one after the other, so the
+# wall time is the sum over architectures.  Those per-architecture device
+# compilations are independent, so this wrapper drives the same pipeline the
+# driver uses internally, but concurrently:
+#
+#   1. one  --offload-host-only    compile  -> host object      (once)
+#   2. N    --offload-device-only  compiles -> per-arch bitcode (in parallel)
+#   3. clang-offload-bundler       -type=o  -> the final object
+#
+# Everything is done with the compiler's own interfaces: no ELF surgery, and
+# the host translation unit is compiled once rather than once per architecture.
+#
+# The exact bundler binary, the -targets list and the compilation-unit id are
+# not guessed: they are read back from the driver itself via -###, so the
+# result matches what a plain multi-arch hipcc would have produced.
+#
+# Under a GNU Make jobserver the wrapper is a cooperative client: it owns one
+# implicit slot (the recipe make already accounted for) and acquires a token per
+# ADDITIONAL concurrent job, so a -jN build does not turn into N*archs processes.
+# Without a jobserver it behaves as before and runs all architectures at once.
+#
+# The wrapper falls back to plain hipcc whenever it is not confident it can
+# reproduce the same result (linking, preprocessing, fewer than two
+# architectures, anything unexpected in the -### output, ...).
+#
+# Environment:
+#   HIPCC_REAL             path to the real hipcc (default: next hipcc in PATH)
+#   HIPCC_PARALLEL_JOBS    max concurrent device compiles (default: all, or as
+#                          many as the jobserver grants)
+#   HIPCC_PARALLEL_JOBSERVER  0 to ignore the GNU Make jobserver
+#   HIPCC_PARALLEL_DEDUP   0 to print every job's diagnostics verbatim
+#   HIPCC_PARALLEL_DEBUG   1 to trace what the wrapper decides to do
+#   HIPCC_PARALLEL_OFF     1 to disable the wrapper entirely
+#
+set -uo pipefail
+
+warn() { printf 'hipcc-parallel: %s\n' "$*" >&2; }
+debug() { [ "${HIPCC_PARALLEL_DEBUG:-0}" = 1 ] && warn "$*"; return 0; }
+
+# ---------------------------------------------------------------- real hipcc
+find_real_hipcc() {
+    if [ -n "${HIPCC_REAL:-}" ]; then printf '%s' "$HIPCC_REAL"; return; fi
+    local self_dir this
+    self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+    while IFS= read -r this; do
+        [ -x "$this" ] || continue
+        [ "$(cd -- "$(dirname -- "$this")" && pwd -P)" = "$self_dir" ] && continue
+        printf '%s' "$this"; return
+    done < <(type -ap hipcc)
+}
+REAL_HIPCC=$(find_real_hipcc)
+if [ -z "$REAL_HIPCC" ]; then
+    warn "cannot locate the real hipcc; set HIPCC_REAL"
+    exit 127
+fi
+
+# $1 is the reason, the rest are the original arguments
+run_plain() { local reason=$1; shift; debug "passthrough: $reason"; exec "$REAL_HIPCC" "$@"; }
+
+[ "${HIPCC_PARALLEL_OFF:-0}" = 1 ] && run_plain "disabled via HIPCC_PARALLEL_OFF" "$@"
+
+# ------------------------------------------------------------ argument scan
+declare -a ARCHS=()      # --offload-arch values, in the order given
+declare -a BASE=()       # every other argument, offload-arch and -o removed
+declare -a DEPFLAGS=()   # -MD/-MMD/-MF/-MT ... , given to the host compile only
+OUTPUT=""
+COMPILE_ONLY=0
+NOT_A_COMPILE=""
+HAVE_MT=0
+HAVE_CUID=0
+
+i=0; argv=("$@"); n=${#argv[@]}
+while [ $i -lt $n ]; do
+    a=${argv[$i]}
+    case "$a" in
+        --offload-arch=*|--cuda-gpu-arch=*|--amdgpu-target=*)
+            ARCHS+=("${a#*=}") ;;
+        --offload-arch|--cuda-gpu-arch|--amdgpu-target)
+            i=$((i+1)); ARCHS+=("${argv[$i]}") ;;
+        -o) i=$((i+1)); OUTPUT=${argv[$i]} ;;
+        -o*) OUTPUT=${a#-o} ;;
+        -c) COMPILE_ONLY=1; BASE+=("$a") ;;
+        # an explicit cuid from the caller wins over the one we read from -###
+        -cuid=*) HAVE_CUID=1; BASE+=("$a") ;;
+        # preprocess / syntax-only / assembly: cheap and single-output, leave alone
+        -E|-S|-fsyntax-only|--version|-M|-MM) NOT_A_COMPILE=$a; BASE+=("$a") ;;
+        -MT|-MQ) HAVE_MT=1; DEPFLAGS+=("$a" "${argv[$((i+1))]}"); i=$((i+1)) ;;
+        -MF) DEPFLAGS+=("$a" "${argv[$((i+1))]}"); i=$((i+1)) ;;
+        -MD|-MMD) DEPFLAGS+=("$a") ;;
+        # Compression applies to the bundle, not to the individual compiles.
+        # Keeping it on the sub-compiles only earns an "argument unused" warning
+        # per job; what the bundler needs is taken from the driver below.
+        --offload-compress|--offload-compression-level=*) ;;
+        # already splitting host/device by hand: do not interfere
+        --offload-host-only|--offload-device-only|--cuda-host-only|--cuda-device-only)
+            NOT_A_COMPILE=$a; BASE+=("$a") ;;
+        *) BASE+=("$a") ;;
+    esac
+    i=$((i+1))
+done
+
+[ -n "$NOT_A_COMPILE" ]   && run_plain "$NOT_A_COMPILE is not a whole-TU object compile" "$@"
+[ "$COMPILE_ONLY" -eq 1 ] || run_plain "not a -c compile (linking?)" "$@"
+[ -n "$OUTPUT" ]          || run_plain "no explicit -o" "$@"
+[ "${#ARCHS[@]}" -ge 2 ]  || run_plain "${#ARCHS[@]} architecture(s), nothing to parallelise" "$@"
+NARCH=${#ARCHS[@]}
+
+# -------------------------------------------------- ask the driver what to do
+# Rather than reconstructing the bundler call, read it back from the driver:
+# -### prints the commands it would run without running them.  From it we take
+#   * the clang-offload-bundler that goes with THIS hipcc (the one in PATH may
+#     belong to a different LLVM),
+#   * the canonical -targets list, whose spelling and order we must reproduce,
+#   * the compilation-unit id the driver picked.
+# The cuid ties device-side static variables to the host code that registers
+# them; every cc1 of one TU must share it.  Our host-only and device-only jobs
+# have different command lines, and clang derives the cuid by hashing the
+# command line (-fuse-cuid=hash), so each would otherwise invent its own.
+DRV=$("$REAL_HIPCC" "$@" -### 2>&1)
+BUNDLER=$(printf '%s\n' "$DRV" | grep -oE '"[^"]*clang-offload-bundler"' | head -1 | tr -d '"')
+TARGETS=$(printf '%s\n' "$DRV" | grep -oE '"-targets=[^"]*"' | head -1 | tr -d '"')
+TARGETS=${TARGETS#-targets=}
+CUID=""
+[ "$HAVE_CUID" -eq 0 ] && CUID=$(printf '%s\n' "$DRV" | grep -oE '"-cuid=[^"]*"' | head -1 | tr -d '"')
+
+# Whatever compression the driver would apply to the bundle, apply the same.
+# Do not hardcode -compress: in RDC mode this ROCm applies compression to the
+# final fat binary at link time and passes nothing here, so inventing a flag
+# would produce an object the plain driver never would.
+declare -a BUNDLE_EXTRA=()
+while IFS= read -r f; do [ -n "$f" ] && BUNDLE_EXTRA+=("$f"); done < <(
+    printf '%s\n' "$DRV" | tr '"' '\n' | grep -E '^-(compress|compression-level=)' | sort -u)
+
+[ -n "$BUNDLER" ] && [ -x "$BUNDLER" ] || run_plain "no usable clang-offload-bundler in -### output" "$@"
+[ -n "$TARGETS" ]                     || run_plain "no -targets in -### output" "$@"
+
+# Split the driver's target list and match each entry to one of our outputs.
+# A device target ends in its architecture, e.g.
+#   hip-amdgcn-amd-amdhsa-unknown-gfx90a:sramecc+   -> gfx90a:sramecc+
+# gfx names never contain '-', so the arch is whatever follows the last '-'.
+declare -a TGT=()
+IFS=',' read -r -a TGT <<< "$TARGETS"
+[ "${#TGT[@]}" -eq "$((NARCH + 1))" ] || run_plain "-### listed ${#TGT[@]} targets for $NARCH architectures" "$@"
+
+arch_index() {  # $1 = arch string -> echoes its index in ARCHS, or nothing
+    local k
+    for ((k = 0; k < NARCH; k++)); do
+        [ "${ARCHS[$k]}" = "$1" ] && { printf '%s' "$k"; return; }
+    done
+}
+
+MAXJOBS=${HIPCC_PARALLEL_JOBS:-$NARCH}
+[ "$MAXJOBS" -ge 1 ] 2>/dev/null || MAXJOBS=$NARCH
+debug "bundler: $BUNDLER"
+debug "targets: $TARGETS"
+debug "cuid:    ${CUID:-<none>}"
+debug "splitting $NARCH architectures (${ARCHS[*]}), max $MAXJOBS concurrent"
+
+# ------------------------------------------------------------------ compile
+TMPDIR_W=$(mktemp -d "${TMPDIR:-/tmp}/hipcc-parallel.XXXXXXXX") || exit 1
+
+# ------------------------------------------------------- GNU Make jobserver
+# make hands out one token per extra job slot.  The recipe running us already
+# owns one slot, so we may always run a single job; every ADDITIONAL concurrent
+# job needs a token, which we give back when we are done.
+#
+# Tokens are single bytes and losing one poisons the build for everyone, so the
+# read must consume EXACTLY one byte.  bash's `read` may buffer ahead on a pipe,
+# so `dd bs=1 count=1` is used instead, and each token is kept in its own file
+# rather than a shell variable (a token byte may be NUL or otherwise unprintable).
+JS_R=""; JS_W=""; JS_TOKENS=0
+
+js_init() {
+    [ "${HIPCC_PARALLEL_JOBSERVER:-1}" = 0 ] && { debug "jobserver: disabled"; return 1; }
+    local mf="${MAKEFLAGS:-}"
+    [ -z "$mf" ] && mf="${CARGO_MAKEFLAGS:-}"
+    [ -z "$mf" ] && { debug "jobserver: no MAKEFLAGS"; return 1; }
+
+    # make >= 4.4 uses a named pipe; older makes pass an inherited fd pair.
+    local fifo
+    fifo=$(printf '%s' "$mf" | grep -oE -- '--jobserver-auth=fifo:[^ ]+' | head -1)
+    if [ -n "$fifo" ]; then
+        fifo=${fifo#--jobserver-auth=fifo:}
+        [ -p "$fifo" ] || { debug "jobserver: '$fifo' is not a fifo"; return 1; }
+        # open read-write so opening never blocks waiting for a writer
+        exec {JS_R}<>"$fifo" || { debug "jobserver: cannot open $fifo"; return 1; }
+        JS_W=$JS_R
+        debug "jobserver: fifo $fifo"
+        return 0
+    fi
+
+    local fds
+    fds=$(printf '%s' "$mf" | grep -oE -- '--jobserver-(auth|fds)=[0-9]+,[0-9]+' | head -1)
+    if [ -n "$fds" ]; then
+        JS_R=${fds##*=}; JS_W=${JS_R#*,}; JS_R=${JS_R%%,*}
+        # make only passes these fds to recipes it considers recursive (ones
+        # marked with '+' or mentioning $(MAKE)).  Otherwise they are closed
+        # here and must not be used - that is what hangs other implementations.
+        if ! { : <&"$JS_R"; } 2>/dev/null || ! { : >&"$JS_W"; } 2>/dev/null; then
+            debug "jobserver: fds $JS_R,$JS_W not inherited (recipe not marked '+')"
+            JS_R=""; JS_W=""; return 1
+        fi
+        debug "jobserver: fds $JS_R,$JS_W"
+        return 0
+    fi
+    debug "jobserver: no --jobserver-auth in MAKEFLAGS"
+    return 1
+}
+
+# Try to take one token without blocking.  Returns 0 if one was acquired.
+js_acquire() {
+    [ -n "$JS_R" ] || return 1
+    local f="$TMPDIR_W/token.$JS_TOKENS"
+    dd bs=1 count=1 iflag=nonblock status=none <&"$JS_R" > "$f" 2>/dev/null
+    if [ -s "$f" ]; then JS_TOKENS=$((JS_TOKENS+1)); return 0; fi
+    rm -f "$f"; return 1
+}
+
+# Give every token back.  Must happen on every exit path, including signals.
+js_release_all() {
+    [ -n "$JS_W" ] || return 0
+    local i
+    for ((i = 0; i < JS_TOKENS; i++)); do
+        [ -f "$TMPDIR_W/token.$i" ] && cat "$TMPDIR_W/token.$i" >&"$JS_W" 2>/dev/null
+    done
+    JS_TOKENS=0
+}
+
+cleanup() {
+    js_release_all
+    [ "${HIPCC_PARALLEL_DEBUG:-0}" = 1 ] || rm -rf "$TMPDIR_W"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
+# Job NARCH is the host compile, jobs 0..NARCH-1 are the device compiles.
+# Each gets its own directory: clang drops per-architecture temporaries next to
+# its output, so this keeps concurrent jobs from colliding.
+HOSTJOB=$NARCH
+declare -a PIDS=() RC=()
+
+launch() {
+    local idx=$1
+    local d="$TMPDIR_W/$idx"
+    mkdir -p "$d"
+    local -a args=("${BASE[@]}")
+    [ -n "$CUID" ] && args+=("$CUID")
+    if [ "$idx" -eq "$HOSTJOB" ]; then
+        # Pass the full architecture list even though this compiles host code
+        # only: it is what the driver does, and without it the driver tries to
+        # detect a local GPU (rocm_agent_enumerator) on every host compile.
+        args+=(--offload-host-only)
+        local a
+        for a in "${ARCHS[@]}"; do args+=("--offload-arch=$a"); done
+        args+=(-o "$d/host.o")
+        # The dependency file is a property of the host compilation.  Without
+        # -MT its rule target would be our private temporary object and make
+        # would never match it against the real one.
+        if [ "${#DEPFLAGS[@]}" -gt 0 ]; then
+            args+=("${DEPFLAGS[@]}")
+            [ "$HAVE_MT" -eq 0 ] && args+=(-MT "$OUTPUT")
+        fi
+    else
+        args+=(--offload-device-only "--offload-arch=${ARCHS[$idx]}" -o "$d/dev.bc")
+    fi
+    "$REAL_HIPCC" "${args[@]}" > "$d/log" 2>&1 &
+    PIDS[$idx]=$!
+}
+
+NJOBS=$((NARCH + 1))
+
+# How many of those may run at once.  Start from the user's cap (+1 for the host
+# job, which is what MAXJOBS has always meant here), then, if a jobserver is
+# present, lower it to what the jobserver actually grants: one implicit slot we
+# already own plus one per token we manage to take.
+SLOTS=$((MAXJOBS + 1))
+[ "$SLOTS" -gt "$NJOBS" ] && SLOTS=$NJOBS
+if js_init; then
+    while [ "$((JS_TOKENS + 1))" -lt "$SLOTS" ] && js_acquire; do :; done
+    SLOTS=$((JS_TOKENS + 1))
+    debug "jobserver: $JS_TOKENS token(s) -> $SLOTS concurrent job(s) of $NJOBS"
+else
+    # No usable jobserver.  make only starts one for -j with N > 1, so a plain
+    # '-j1' (or fds we were not given) would otherwise leave us running every
+    # architecture at once - the opposite of what -j1 asks for.  Fall back to
+    # the -jN in MAKEFLAGS when it names a number; a bare '-j' means unlimited.
+    jn=$(printf '%s' "${MAKEFLAGS:-}" | grep -oE -- '-j[0-9]+' | head -1)
+    jn=${jn#-j}
+    if [ -n "$jn" ] && [ "$jn" -ge 1 ] 2>/dev/null && [ "$jn" -lt "$SLOTS" ]; then
+        SLOTS=$jn
+        debug "no jobserver: capped to -j$jn from MAKEFLAGS -> $SLOTS of $NJOBS"
+    else
+        debug "no jobserver: $SLOTS concurrent job(s) of $NJOBS"
+    fi
+fi
+
+running=0; next=0
+while [ "$next" -lt "$NJOBS" ] || [ "$running" -gt 0 ]; do
+    while [ "$next" -lt "$NJOBS" ] && [ "$running" -lt "$SLOTS" ]; do
+        launch "$next"; next=$((next+1)); running=$((running+1))
+    done
+    wait -n 2>/dev/null
+    running=0
+    for ((j = 0; j < next; j++)); do
+        kill -0 "${PIDS[$j]}" 2>/dev/null && running=$((running+1))
+    done
+done
+
+failed=0
+for ((j = 0; j < NJOBS; j++)); do
+    wait "${PIDS[$j]}"; RC[$j]=$?
+    [ "${RC[$j]}" -ne 0 ] && failed=1
+done
+
+# ------------------------------------------------------- diagnostics replay
+# Host diagnostics come from the host job; each device job reports only what it
+# saw for its own architecture, so there is no duplication to filter here --
+# unlike the host-repeated-N-times scheme this replaces.  Still de-duplicate by
+# default, since the device jobs re-parse the same headers.
+cat "$TMPDIR_W/$HOSTJOB/log" >&2
+for ((j = 0; j < NARCH; j++)); do
+    [ -s "$TMPDIR_W/$j/log" ] || continue
+    if [ "${HIPCC_PARALLEL_DEDUP:-1}" = 0 ]; then
+        sed "s|^|[${ARCHS[$j]}] |" "$TMPDIR_W/$j/log" >&2
+    else
+        grep -vxF -f "$TMPDIR_W/$HOSTJOB/log" -- "$TMPDIR_W/$j/log" 2>/dev/null \
+            | sed "s|^|[${ARCHS[$j]}] |" >&2
+    fi
+done
+
+if [ "$failed" -ne 0 ]; then
+    for ((j = 0; j < NARCH; j++)); do
+        [ "${RC[$j]}" -ne 0 ] && warn "device compilation failed for ${ARCHS[$j]} (exit ${RC[$j]})"
+    done
+    [ "${RC[$HOSTJOB]}" -ne 0 ] && warn "host compilation failed (exit ${RC[$HOSTJOB]})"
+    exit 1
+fi
+
+# -------------------------------------------------------------------- bundle
+# Feed the inputs in the driver's own target order.
+declare -a BARGS=(-type=o "-targets=$TARGETS")
+[ "${#BUNDLE_EXTRA[@]}" -gt 0 ] && BARGS+=("${BUNDLE_EXTRA[@]}")
+for t in "${TGT[@]}"; do
+    if [ "${t#host-}" != "$t" ]; then
+        BARGS+=("-input=$TMPDIR_W/$HOSTJOB/host.o")
+    else
+        idx=$(arch_index "${t##*-}")
+        [ -n "$idx" ] || { warn "target '$t' matches no --offload-arch; falling back"; exec "$REAL_HIPCC" "$@"; }
+        BARGS+=("-input=$TMPDIR_W/$idx/dev.bc")
+    fi
+done
+BARGS+=("-output=$OUTPUT")
+
+if ! "$BUNDLER" "${BARGS[@]}"; then
+    warn "clang-offload-bundler failed; falling back to a single serial compile"
+    exec "$REAL_HIPCC" "$@"
+fi
+
+debug "wrote $OUTPUT from $NARCH device objects + 1 host object"
+exit 0
