@@ -110,6 +110,10 @@ while [ $i -lt $n ]; do
         # Keeping it on the sub-compiles only earns an "argument unused" warning
         # per job; what the bundler needs is taken from the driver below.
         --offload-compress|--offload-compression-level=*) ;;
+        # --offload-jobs only has an effect on the link (clang-linker-wrapper);
+        # on a -c compile it is either ignored or diagnosed as unused, and the
+        # sub-compiles have no device work of their own to parallelise.
+        --offload-jobs=*|-parallel-jobs=*) ;;
         # already splitting host/device by hand: do not interfere
         --offload-host-only|--offload-device-only|--cuda-host-only|--cuda-device-only)
             NOT_A_COMPILE=$a; BASE+=("$a") ;;
@@ -150,16 +154,34 @@ declare -a BUNDLE_EXTRA=()
 while IFS= read -r f; do [ -n "$f" ] && BUNDLE_EXTRA+=("$f"); done < <(
     printf '%s\n' "$DRV" | tr '"' '\n' | grep -E '^-(compress|compression-level=)' | sort -u)
 
-[ -n "$BUNDLER" ] && [ -x "$BUNDLER" ] || run_plain "no usable clang-offload-bundler in -### output" "$@"
-[ -n "$TARGETS" ]                     || run_plain "no -targets in -### output" "$@"
+# With --offload-new-driver the driver does not bundle: it packages the
+# per-architecture bitcode with clang-offload-packager and embeds the package
+# into the host object.  Detect which pipeline this hipcc is running.
+# ROCm 7.14 renamed clang-offload-packager to llvm-offload-binary; accept both.
+PACKAGER=$(printf '%s\n' "$DRV" | grep -oE '"[^"]*(clang-offload-packager|llvm-offload-binary)"' | head -1 | tr -d '"')
+declare -a IMAGES=()
+NEWDRIVER=0
+if [ -z "$BUNDLER" ] && [ -n "$PACKAGER" ] && [ -x "$PACKAGER" ]; then
+    NEWDRIVER=1
+    while IFS= read -r im; do
+        [ -n "$im" ] && IMAGES+=("$im")
+    done < <(printf '%s\n' "$DRV" | grep -oE '"--image=file=[^"]*"' | tr -d '"')
+    [ "${#IMAGES[@]}" -eq "$NARCH" ] || run_plain "-### listed ${#IMAGES[@]} images for $NARCH architectures" "$@"
+    debug "new offloading driver: packager $PACKAGER"
+else
+    [ -n "$BUNDLER" ] && [ -x "$BUNDLER" ] || run_plain "no usable clang-offload-bundler in -### output" "$@"
+    [ -n "$TARGETS" ]                     || run_plain "no -targets in -### output" "$@"
+fi
 
 # Split the driver's target list and match each entry to one of our outputs.
 # A device target ends in its architecture, e.g.
 #   hip-amdgcn-amd-amdhsa-unknown-gfx90a:sramecc+   -> gfx90a:sramecc+
 # gfx names never contain '-', so the arch is whatever follows the last '-'.
 declare -a TGT=()
-IFS=',' read -r -a TGT <<< "$TARGETS"
-[ "${#TGT[@]}" -eq "$((NARCH + 1))" ] || run_plain "-### listed ${#TGT[@]} targets for $NARCH architectures" "$@"
+if [ "$NEWDRIVER" -eq 0 ]; then
+    IFS=',' read -r -a TGT <<< "$TARGETS"
+    [ "${#TGT[@]}" -eq "$((NARCH + 1))" ] || run_plain "-### listed ${#TGT[@]} targets for $NARCH architectures" "$@"
+fi
 
 arch_index() {  # $1 = arch string -> echoes its index in ARCHS, or nothing
     local k
@@ -377,7 +399,14 @@ launch() {
     PIDS[$idx]=$!
 }
 
-NJOBS=$((NARCH + 1))
+# The old driver can build the host image and each device image in parallel.
+# Under the new driver the host compile consumes the packaged device images,
+# so it cannot overlap them.
+if  [ "$NEWDRIVER" -eq 1 ]; then
+  NJOBS=$NARCH
+else
+  NJOBS=$((NARCH + 1))
+fi
 
 # How many of those may run at once.  Start from the user's cap (+1 for the host
 # job, which is what MAXJOBS has always meant here), then, if a jobserver is
@@ -453,13 +482,13 @@ done
 # saw for its own architecture, so there is no duplication to filter here --
 # unlike the host-repeated-N-times scheme this replaces.  Still de-duplicate by
 # default, since the device jobs re-parse the same headers.
-cat "$TMPDIR_W/$HOSTJOB/log" >&2
+[ "$NEWDRIVER" -eq 1 ] || cat "$TMPDIR_W/$HOSTJOB/log" >&2
 for ((j = 0; j < NARCH; j++)); do
     [ -s "$TMPDIR_W/$j/log" ] || continue
-    if [ "${HIPCC_PARALLEL_DEDUP:-1}" = 0 ]; then
+    if [ "${HIPCC_PARALLEL_DEDUP:-1}" = 0 ] || [ "$NEWDRIVER" -eq 1 ]; then
         sed "s|^|[${ARCHS[$j]}] |" "$TMPDIR_W/$j/log" >&2
     else
-        grep -vxF -f "$TMPDIR_W/$HOSTJOB/log" -- "$TMPDIR_W/$j/log" 2>/dev/null \
+        grep -vxF -f "$TMPDIR_W/${HOSTJOB}/log" -- "$TMPDIR_W/$j/log" 2>/dev/null \
             | sed "s|^|[${ARCHS[$j]}] |" >&2
     fi
 done
@@ -468,8 +497,54 @@ if [ "$failed" -ne 0 ]; then
     for ((j = 0; j < NARCH; j++)); do
         [ "${RC[$j]}" -ne 0 ] && warn "device compilation failed for ${ARCHS[$j]} (exit ${RC[$j]})"
     done
-    [ "${RC[$HOSTJOB]}" -ne 0 ] && warn "host compilation failed (exit ${RC[$HOSTJOB]})"
+    [ "$NEWDRIVER" -eq 1 ] || { [ "${RC[$HOSTJOB]}" -ne 0 ] && warn "host compilation failed (exit ${RC[$HOSTJOB]})"; }
     exit 1
+fi
+
+# ------------------------------------------------------- package + host (new)
+if [ "$NEWDRIVER" -eq 1 ]; then
+    # Package the per-architecture bitcode exactly as the driver would: keep
+    # each --image= spec verbatim except for the file= path, which we point at
+    # our own output.  triple=, arch= and kind= are toolchain spellings and are
+    # not reconstructed.
+    declare -a PARGS=(-o "$TMPDIR_W/pkg.out")
+    for im in "${IMAGES[@]}"; do
+        rest=${im#--image=file=}          # <path>,triple=...,arch=...,kind=hip
+        spec=${rest#*,}                   # triple=...,arch=...,kind=hip
+        a=${spec##*arch=}; a=${a%%,*}
+        idx=$(arch_index "$a")
+        if [ -z "$idx" ]; then
+            warn "--image for arch '$a' matches no --offload-arch; falling back"
+            cleanup; trap - EXIT; exec "$REAL_HIPCC" "$@"
+        fi
+        PARGS+=("--image=file=$TMPDIR_W/$idx/dev.bc,$spec")
+    done
+    if ! "$PACKAGER" "${PARGS[@]}"; then
+        warn "clang-offload-packager failed; falling back to a single serial compile"
+        cleanup; trap - EXIT
+        exec "$REAL_HIPCC" "$@"
+    fi
+
+    # One host compile, with the package embedded.  Writes the caller's object
+    # directly, so there is nothing left to bundle.
+    declare -a HARGS=("${BASE[@]}")
+    [ -n "$CUID" ] && HARGS+=("$CUID")
+    HARGS+=(--offload-host-only)
+    for a in "${ARCHS[@]}"; do HARGS+=("--offload-arch=$a"); done
+    # The driver never forwards -fembed-offload-object from the command line:
+    # it only synthesises it for the host job it builds itself.  Hand it to
+    # cc1 directly.
+    HARGS+=(-Xclang "-fembed-offload-object=$TMPDIR_W/pkg.out" -o "$OUTPUT")
+    if [ "${#DEPFLAGS[@]}" -gt 0 ]; then
+        HARGS+=("${DEPFLAGS[@]}")
+        [ "$HAVE_MT" -eq 0 ] && HARGS+=(-MT "$OUTPUT")
+    fi
+    if ! "$REAL_HIPCC" "${HARGS[@]}" < /dev/null; then
+        warn "host compilation failed"
+        exit 1
+    fi
+    debug "wrote $OUTPUT from $NARCH device bitcodes + 1 host object (new driver)"
+    exit 0
 fi
 
 # -------------------------------------------------------------------- bundle

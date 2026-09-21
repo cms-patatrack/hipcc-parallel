@@ -3,6 +3,9 @@
 A drop-in `hipcc` wrapper that compiles one source file for several GPU architectures
 **in parallel** instead of one after another.
 
+It handles both offloading drivers: it detects from `hipcc … -###` which pipeline the
+compiler is running and splits that one. See *How it works*.
+
 ## The problem
 
 `hipcc` walks its `--offload-arch` list sequentially. For a translation unit built for N
@@ -26,22 +29,47 @@ instantiating the same headers once per architecture.
 
 ## How it works
 
-It drives the same pipeline the clang driver uses internally, but concurrently:
+It drives the same pipeline the clang driver uses internally, but concurrently. Which
+pipeline that is depends on the driver, and the wrapper decides by reading back
+`hipcc … -###` — which prints the commands the driver *would* run without running them.
+
+### Old offloading driver (default through ROCm 10.0)
 
 1. one `--offload-host-only` compile → host object (**once**, not once per architecture)
 2. N `--offload-device-only --offload-arch=X` compiles → per-architecture bitcode, in parallel
 3. `clang-offload-bundler -type=o` → the final object
 
+All N+1 jobs are independent, so the wall time is `max(host, device)`.
+
 The bundler binary, the `-targets` list and the compilation-unit id are **not guessed** —
-they are read back from the driver itself via `hipcc … -###`, which prints the commands it
-would run without running them. This matters: the `clang-offload-bundler` on `PATH` may
+they are read back from `-###`. This matters: the `clang-offload-bundler` on `PATH` may
 belong to a different LLVM than the one `hipcc` uses, and the target spelling
 (`hip-amdgcn-amd-amdhsa-unknown-gfx1100`, host entry last) is toolchain-specific.
 
+### New offloading driver (`--offload-new-driver`; default from ROCm 10.1)
+
+1. N `--offload-device-only --offload-arch=X` compiles → per-architecture bitcode, in parallel
+2. `llvm-offload-binary` → one package holding all N device images
+3. one `--offload-host-only` compile with that package embedded → the final object
+
+The `--image=file=…,triple=…,arch=…,kind=hip` specs handed to the packager are copied
+verbatim from `-###` except for the `file=` path. The triple, arch and kind spellings are
+toolchain-specific (`gfx90a:sramecc+` target IDs included) and are not reconstructed.
+
+`--offload-jobs=` / `-parallel-jobs=` are dropped from the sub-compiles. They only affect
+the link, and on a `-c` compile they are either ignored or diagnosed as unused, once per
+job.
+
 ## Correctness
 
-Output is **byte-for-byte identical** to plain `hipcc`, verified on an 82 MB object and on
-small test files.
+Output is **byte-for-byte identical** to plain `hipcc`, for both pipelines — verified on an
+82 MB object and on small test files, and re-verified after every change to the jobserver
+logic:
+
+```
+hipcc -c -fgpu-rdc                      $ARCHS …   vs wrapper   → identical
+hipcc -c -fgpu-rdc --offload-new-driver $ARCHS …   vs wrapper   → identical
+```
 
 One caveat, because it is easy to misread a `cmp`. Clang derives the HIP compilation-unit
 id (`__hip_cuid_…`) by hashing the file path *and the whole command line*, and it **hashes
@@ -80,6 +108,36 @@ cmake -DCMAKE_HIP_COMPILER_LAUNCHER=/path/to/hipcc-parallel/hipcc …
 
 Build systems that refer to the compiler by absolute path will not pick it up from `PATH`;
 point the relevant variable at it directly.
+
+### Under GNU Make
+
+Point the compile rule at the wrapper and mark the recipe recursive:
+
+```make
+-  $(CC_HIP) -c $(HIPFLAGS) -o $@ $<
++  +$(HIPCC_PARALLEL) -c $(HIPFLAGS) -o $@ $<
+```
+
+If the device link is also to run in parallel, add to the flags used by both the compile
+and the link:
+
+```
+--offload-new-driver --offload-jobs=jobserver
+```
+
+and, if the build extracts device code out of objects itself, note that the new driver
+stores it in a `.llvm.offloading` section rather than `__CLANG_OFFLOAD_BUNDLE*`:
+
+```make
+-  objcopy -j '__CLANG_OFFLOAD_BUNDLE*' $^ $@
++  objcopy -j '.llvm.offloading*' $^ $@
+```
+
+**The leading `+` on the compile recipe is not optional.** GNU Make only passes the
+jobserver descriptors to recipes it considers recursive. Without it the wrapper cannot see
+the jobserver and falls back (see below), and — once the driver itself does the
+parallelising in 10.1 — LLVM's own jobserver client fails *open*, to every core on the
+machine.
 
 ## GNU Make jobserver
 
@@ -178,7 +236,9 @@ guarantee the same result:
 - no explicit `-o`
 - fewer than two `--offload-arch` values
 - the caller already passed `--offload-{host,device}-only`
-- anything unexpected in the `-###` output, or a bundler failure
+- anything unexpected in the `-###` output: no usable bundler *and* no usable packager, a
+  `-targets` list or `--image=` set that does not match the requested architectures, or a
+  bundler/packager that fails at the end
 
 ## Notes and limitations
 
@@ -186,20 +246,32 @@ guarantee the same result:
   filtered to the lines the host job did not already produce, prefixed with its
   architecture, so a warning does not appear N times. `HIPCC_PARALLEL_DEDUP=0` disables
   this.
-- **`--offload-compress`** is handled by mirroring whatever the driver passes to its own
-  bundler. On ROCm 7.14 that is *nothing*: compression applies to the final fat binary at
-  link time, and the compile-time object is byte-identical with and without the flag.
-  Hardcoding `-compress` would produce an object the driver never would.
+- **`--offload-compress`** is handled, on the old-driver path, by mirroring whatever the
+  driver passes to its own bundler. On ROCm 7.14 that is *nothing*: compression applies to
+  the final fat binary at link time, and the compile-time object is byte-identical with and
+  without the flag. Hardcoding `-compress` would produce an object the driver never would.
+  On the new-driver path nothing is mirrored to `llvm-offload-binary` at all, for the same
+  reason — `-###` passes it no compression arguments in RDC mode. If a future ROCm starts
+  compressing at compile time, this is the first thing that will need revisiting.
 - **The architecture list given to the host compile is inert** — the host object is
   byte-identical whatever it is, or even with none. It is passed only to stop the driver
   shelling out to `rocm_agent_enumerator` to autodetect a local GPU.
 - The wrapper addresses **compilation only**. Where the device link dominates the build,
-  parallelising the compile will not move it.
+  parallelising the compile will not move it — and on a large RDC build it usually does
+  dominate. Measured on a large multi-package build (4 architectures, `-j16`, 62 cores):
+  one device link took 4619 s of a 5805 s build, 80% of the total, running single-threaded
+  at the end with 61 cores idle. Parallelising every compile in that build was worth 1.13x;
+  switching the *link* to the new driver with `--offload-jobs=jobserver` took it to 4.53x.
+  The two compose — use both.
+- **Peak memory goes up** once the link is parallel too: 12.2 GB against 5.1 GB on that
+  build, all of it in the device link running four LTO codegens of the same module at once.
+  It scales with architectures, not with `-jN`.
 
 ## Related work
 
 [StreamHPC/phc](https://github.com/StreamHPC/phc) splits multi-architecture HIP compiles in
 the same spirit, for the whole-program (non-RDC) model, and adds sccache and Ninja-trace
 integration. It does not support `-fgpu-rdc`: given it, it emits a whole-program object with
-an embedded `.hip_fatbin` rather than the `__CLANG_OFFLOAD_BUNDLE__*` sections an RDC device
-link needs.
+an embedded `.hip_fatbin` rather than the device code an RDC link needs —
+`__CLANG_OFFLOAD_BUNDLE__*` sections under the old driver, a `.llvm.offloading` section
+under the new one.
