@@ -91,6 +91,16 @@ within `N`, instead of becoming `N × architectures` processes.
 Both protocols are supported: the named pipe used by GNU Make ≥ 4.4
 (`--jobserver-auth=fifo:PATH`) and the inherited fd pair used by older makes.
 
+### Tokens are re-checked while the compile runs
+
+The wrapper asks for tokens at startup, and then again every `HIPCC_PARALLEL_JOBSERVER_RETRY`
+seconds (default 10), for as long as there is still an architecture waiting for a slot.
+
+Since `wait` in bash has no timeout, the retry is implemented by putting a `sleep` in the
+same job pool, so `wait -n` returns either when a compile finishes or when the interval
+elapses, whichever comes first. Setting the interval to `0` restores the old
+decide-once-at-startup behaviour.
+
 Observed behaviour (GNU Make 4.3, 4 architectures → 5 jobs):
 
 | context | result |
@@ -99,8 +109,9 @@ Observed behaviour (GNU Make 4.3, 4 architectures → 5 jobs):
 | `make -j4`, recipe marked `+` | 3 tokens → 4 concurrent |
 | `make -j4`, ordinary recipe | fds not inherited → degrades to the `-j4` cap |
 | `make -j1` | capped to 1 |
+| `make -j2`, another recipe holding the only spare slot | starts at 1 concurrent, picks up `+1` within 10 s of that recipe finishing (185 s → 116 s; 39 s if started unconstrained) |
 
-Two details worth knowing:
+Three details worth knowing:
 
 - **GNU Make only passes the jobserver fds to recipes it considers recursive** (prefixed
   `+`, or mentioning `$(MAKE)`). For an ordinary recipe it still advertises
@@ -109,6 +120,10 @@ Two details worth knowing:
 - **`make -j1` starts no jobserver at all.** Without a fallback the wrapper would run every
   architecture at once, the opposite of what `-j1` asks for, so when there is no usable
   jobserver it honours a numeric `-jN` from `MAKEFLAGS`. A bare `-j` means unlimited.
+- **Tokens acquired late are still released on every exit path**, including signals: they
+  are handed back only after the jobs they covered have actually died. Re-checking widens
+  the window in which the wrapper holds tokens, so this matters more than it used to —
+  the regression test below is the one that catches it.
 
 Tokens are single bytes, and losing one poisons the build for every other process, so the
 read consumes *exactly* one byte (`dd bs=1 count=1`, not a shell `read`, which may buffer
@@ -148,6 +163,7 @@ reaches them either, so `SIGTSTP`/`SIGCONT` are forwarded as well.
 | `HIPCC_REAL` | path to the real `hipcc` (default: the next `hipcc` in `PATH` that is not this script) |
 | `HIPCC_PARALLEL_JOBS` | cap on concurrent device compiles (default: all, or as many as the jobserver grants) |
 | `HIPCC_PARALLEL_JOBSERVER` | `0` to ignore the jobserver entirely |
+| `HIPCC_PARALLEL_JOBSERVER_RETRY` | seconds between attempts to acquire another jobserver token while an architecture is still queued (default `10`; `0` decides once at startup) |
 | `HIPCC_PARALLEL_DEDUP` | `0` to print every job's diagnostics verbatim instead of de-duplicating |
 | `HIPCC_PARALLEL_DEBUG` | `1` to trace what the wrapper decides, and keep the temp directory |
 | `HIPCC_PARALLEL_OFF` | `1` to disable the wrapper (straight passthrough) |
